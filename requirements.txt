@@ -1,0 +1,23 @@
+# 大黄鱼声信号分类 —— Python 依赖
+# 核心依赖（src/ 与 scripts/ 运行所需；音频前端不依赖 librosa/numba）
+numpy>=1.24
+scipy>=1.10
+soundfile>=0.12
+soxr>=0.3
+matplotlib>=3.7
+scikit-learn>=1.3
+safetensors>=0.4
+onnx>=1.16
+onnxruntime>=1.17
+tqdm>=4.65
+
+# 可选：仅 tutorials/ 早期教学脚本用 librosa；src 核心包不依赖。
+# 若安装后遇到 numba JIT 多线程初始化卡死（librosa 1.0 / numba 0.67 上出现过），
+# 可不装 librosa，直接用 src/fishsound/features.py 的手写 mel 前端。
+# librosa>=0.10
+
+# torch / torchaudio 请按显卡 CUDA 版本单独安装（不要直接用上面的 CPU 轮子）：
+#   CUDA 12.x（如 RTX 5060 Ti / 3050）：
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+#   仅 CPU 环境：
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu

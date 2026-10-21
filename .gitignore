@@ -1,0 +1,30 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# ---- 数据 / 模型 / 音频（体积大，不入库）----
+data/*
+!data/README.md
+outputs/
+*.wav
+*.flac
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.pkl
+_verify/
+
+# ---- 临时结果 ----
+*.csv
+*.log
+
+# ---- IDE / 系统 ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
