@@ -19,8 +19,9 @@ outputs/
 *.pkl
 _verify/
 
-# ---- 临时结果 ----
+# ---- 临时结果（扫描输出/数据清单等大表不入库；results/ 下的结果表保留）----
 *.csv
+!results/*.csv
 *.log
 
 # ---- IDE / 系统 ----

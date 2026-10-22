@@ -48,17 +48,26 @@ def read_preprocess_meta(onnx_path):
     return None
 
 
-def load_torch_for_export(ckpt_path, device="cpu"):
+def load_torch_for_export(ckpt_path, device="cpu", model_name=None):
+    """加载 checkpoint 并套上部署外壳。
+
+    model_name: 'cnn14'（默认）或轻量模型 'dscnn' / 'mobilenet'。
+    """
     ck = torch.load(ckpt_path, map_location=device, weights_only=False)
-    model = Cnn14(len(ck.get("labels", C.LABELS)))
+    labels = ck.get("labels", C.LABELS)
+    if model_name is None or model_name == "cnn14":
+        model = Cnn14(len(labels))
+    else:
+        from .models import build_lightweight
+        model = build_lightweight(model_name, classes=len(labels))
     model.load_state_dict(ck["state_dict"])
     model.eval().to(device)
     return InferenceWrapper(model).eval(), ck
 
 
-def export_onnx(ckpt_path, onnx_path, opset=17):
+def export_onnx(ckpt_path, onnx_path, opset=17, model_name=None):
     """导出 ONNX（传统 TorchScript 导出器，dynamo=False 更稳）。"""
-    wrapper, ck = load_torch_for_export(ckpt_path)
+    wrapper, ck = load_torch_for_export(ckpt_path, model_name=model_name)
     dummy = torch.randn(1, C.N_MELS, C.N_FRAMES, dtype=torch.float32)
     torch.onnx.export(
         wrapper, dummy, onnx_path,
@@ -72,10 +81,10 @@ def export_onnx(ckpt_path, onnx_path, opset=17):
     return onnx_path
 
 
-def verify_onnx(ckpt_path, onnx_path, atol=1e-4):
+def verify_onnx(ckpt_path, onnx_path, atol=1e-4, model_name=None):
     """对比 PyTorch 与 ONNX 对同一输入的输出，返回最大误差。"""
     import onnxruntime as ort
-    wrapper, _ = load_torch_for_export(ckpt_path)
+    wrapper, _ = load_torch_for_export(ckpt_path, model_name=model_name)
     x = torch.randn(1, C.N_MELS, C.N_FRAMES)
     with torch.no_grad():
         ref = wrapper(x).numpy()
@@ -105,12 +114,16 @@ def quantize_mixed_int8(onnx_path, calib_mels, out_path,
     from onnxruntime.quantization import (
         quantize_static, CalibrationDataReader, QuantType, QuantFormat,
         CalibrationMethod)
-    sensitive_nodes = sensitive_nodes or C.QUANT_SENSITIVE_NODES
+    sensitive_nodes = (sensitive_nodes if sensitive_nodes is not None
+                       else C.QUANT_SENSITIVE_NODES)
     method = (CalibrationMethod.Entropy if method == "entropy"
               else CalibrationMethod.MinMax)
 
     class Cal(CalibrationDataReader):
         def __init__(self, x):
+            if hasattr(x, "detach"):  # 兼容 torch tensor
+                x = x.detach().cpu().numpy()
+            x = np.asarray(x, dtype=np.float32)
             self.en = iter([{"mel": x[i:i + 1]} for i in range(len(x))])
 
         def get_next(self):
@@ -152,7 +165,7 @@ def quantize_mixed_int8(onnx_path, calib_mels, out_path,
     return out_path
 
 
-def benchmark(path, backend=None, batch=1, n=80, warmup=8):
+def benchmark(path, backend=None, batch=1, n=80, warmup=8, model_name=None):
     """测单批推理延迟，返回 (中位数ms, p95ms)。"""
     x = np.random.randn(batch, C.N_MELS, C.N_FRAMES).astype(np.float32)
     if path.lower().endswith(".onnx") or backend == "onnx":
@@ -162,7 +175,7 @@ def benchmark(path, backend=None, batch=1, n=80, warmup=8):
         def run():
             sess.run(["logits"], {"mel": x})
     else:
-        wrapper, _ = load_torch_for_export(path)
+        wrapper, _ = load_torch_for_export(path, model_name=model_name)
 
         def run():
             with torch.no_grad():

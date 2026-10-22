@@ -104,12 +104,13 @@ fish-sound-classification/
 │   ├── train.py            # 迁移学习 & 从零训练（加权CE/AMP/梯度累积/BN冻结）
 │   ├── infer.py            # PyTorch/ONNX 双后端滑窗扫描、成片检测
 │   └── deploy.py           # ONNX 导出/数值校验/INT8量化/延迟基准
-├── scripts/                # 端到端入口（5 个）
+├── scripts/                # 端到端入口（6 个）
 │   ├── 01_train.py         # CNN14 迁移学习训练
 │   ├── 02_scan.py          # 单文件 / 全天扫描出昼夜曲线
 │   ├── 03_export_onnx.py   # 导出 ONNX 并校验
-│   ├── 04_quantize.py      # INT8 混合精度量化与对比
-│   └── 05_model_compare.py # 三模型选型对比（参数量/精度/CPU延迟）
+│   ├── 04_quantize.py      # CNN14 INT8 混合精度量化与对比
+│   ├── 05_model_compare.py # 三模型选型对比（参数量/精度/CPU延迟）
+│   └── 06_deploy_lightweight.py # 轻量模型 ONNX/INT8 端侧部署对比
 ├── tutorials/              # 从 0 到 1 的 52 个带中文注释学习脚本（8 阶段）
 ├── results/                # 精选结果图
 ├── data/                   # 数据目录（不入库，见 data/README.md）
@@ -154,7 +155,8 @@ python scripts/02_scan.py --dir "全天录音目录"           # 全天 48 段
 ```bash
 python scripts/03_export_onnx.py
 python scripts/04_quantize.py
-python scripts/05_model_compare.py   # 可选：DS-CNN/MobileNet/CNN14 选型对比
+python scripts/05_model_compare.py    # 可选：DS-CNN/MobileNet/CNN14 选型对比
+python scripts/06_deploy_lightweight.py  # 可选：轻量模型 ONNX/INT8 端侧部署
 ```
 
 导出时会在 ONNX 旁边生成一个 `*.onnx.preprocess.json`，记录标准化参数（mean/std）
@@ -211,6 +213,32 @@ for start, end, peak, _ in detect_segments(mid_sec, fish_prob):
 数据增强，可望在保持目标类召回的同时拿到端侧的小体积与低延迟——这是比"无脑换小模型"
 更稳的工程路线。
 
+### 端侧部署实测（`scripts/06_deploy_lightweight.py`）
+
+对两个轻量模型导出 ONNX 并做 INT8 量化（ONNX Runtime CPU，Entropy 校准、QDQ、per-channel）：
+
+| 模型 | 版本 | 体积 | CPU b1 | CPU b16 | 准确率 | 真鱼 F1 |
+| --- | --- | --- | --- | --- | --- | --- |
+| **DS-CNN** | fp32 | 0.56 MB | 0.42 ms | 6.0 ms | 85% | 44% |
+| **DS-CNN** | **INT8 混合** | **0.20 MB** | **0.40 ms** | 5.4 ms | 85% | 44% |
+| MobileNet | fp32 | 6.05 MB | 0.86 ms | 15.1 ms | 80% | 55% |
+| MobileNet | INT8 全量化 | 1.62 MB | 0.50 ms | 6.2 ms | 82% | 60% |
+| CNN14 | fp32 | 318.7 MB | 46.6 ms | 628 ms | 85% | 89% |
+| CNN14 | INT8 混合 | 80.0 MB | 17.9 ms | 234.6 ms | 85% | 89% |
+
+![轻量端侧部署](results/12_轻量模型端侧部署.png)
+
+要点：
+
+- **压缩到极致**：DS-CNN 混合 INT8 仅 **0.20 MB（约 200 KB）**、单窗 **0.40 ms**；相比
+  CNN14 fp32 体积小约 **1600 倍**、单窗快约 **117 倍**，可直接塞进 MCU / 低功耗水声节点。
+  3 秒窗只花 0.4 ms，相当于约 **7500 倍实时**，CPU 占用几乎可忽略。
+- **量化本身几乎无损**：DS-CNN 混合精度准确率保持 85%（全量化掉 3%，保留首层 stem 卷积
+  与分类头 fp32 后恢复）；MobileNet 全量化真鱼 F1 反而 55%→60%。轻量模型当前的 F1 偏低是
+  **训练数据太少**导致，不是量化导致——量化前后 F1 一致。
+- **ONNX Runtime 对小模型优化显著**：同一 DS-CNN，PyTorch CPU b1 为 4.6 ms，ONNX 仅
+  0.42 ms（约 11 倍），这也是部署要走 ONNX 而非直接跑 PyTorch 的原因。
+
 ---
 
 ## 七、技术亮点（面试可讲）
@@ -238,6 +266,9 @@ for start, end, peak, _ in detect_segments(mid_sec, fish_prob):
    CNN14（80M）的参数量、CPU 延迟、准确率与**目标类 P/R/F1**，用数据讲清"轻量模型
    快 20×、小 565×，但在小样本 + 稀有目标类上召回不足"，并给出"先预训练大模型、
    数据到位后知识蒸馏到端侧"的分阶段路线，而不是盲目追小或盲目追大。
+9. **端侧极致压缩落地**：把 DS-CNN 经 ONNX → INT8 混合量化后压到 **0.20 MB、CPU 单窗
+   0.4 ms（约 7500 倍实时）**，相比 CNN14 fp32 体积小 1600 倍、快 117 倍；并验证量化
+   在轻量模型上几乎无损（首层/分类头保留 fp32），具备 MCU / 低功耗水声节点部署能力。
 
 ---
 
