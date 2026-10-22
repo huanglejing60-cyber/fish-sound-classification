@@ -114,3 +114,64 @@ def evaluate_model(model, Xva, Yva, batch=16, device=None):
 def save_checkpoint(path, state_dict, mean, std, labels=C.LABELS):
     torch.save({"state_dict": state_dict, "mean": float(mean),
                 "std": float(std), "labels": labels}, path)
+
+
+def train_from_scratch(Xtr, Ytr, Xva, Yva, model,
+                       epochs=40, batch=4, accum=2, lr=1e-3,
+                       weight_decay=1e-4, device=None, log_every=5, verbose=True):
+    """从零训练轻量模型（DS-CNN / MobileNet）。
+
+    与 train_finetune 保持完全一致的训练口径（加权 CE、AdamW、小 batch+梯度
+    累积、AMP、seed42、按验证准确率存最佳），区别只有两点：
+    1) 所有参数都训练（没有预训练权重可冻结）；
+    2) 从零训练需要更大的学习率（1e-3，迁移学习只用 1e-4），并配余弦退火。
+    这样三个模型只差在"网络结构 + 是否预训练"，对比才公平。
+    """
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(42)
+    np.random.seed(42)
+
+    model.to(device)
+    w = torch.tensor(class_weights(Ytr), dtype=torch.float32, device=device)
+    criterion = nn.CrossEntropyLoss(weight=w)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+
+    Xtr, Ytr = Xtr.to(device), Ytr.to(device)
+    Xva, Yva = Xva.to(device), Yva.to(device)
+
+    history = {"acc": [], "precision": [], "recall": [], "loss": []}
+    best_acc, best_state = -1.0, None
+
+    for ep in range(1, epochs + 1):
+        model.train()
+        idx = torch.randperm(len(Xtr))
+        opt.zero_grad()
+        total = 0.0
+        for bi0 in range(0, len(Xtr), batch):
+            bi = idx[bi0:bi0 + batch]
+            with torch.autocast("cuda", enabled=device.type == "cuda"):
+                out, _ = model(Xtr[bi])
+                loss = criterion(out, Ytr[bi]) / accum
+            scaler.scale(loss).backward()
+            total += loss.item() * accum
+            if (bi0 // batch + 1) % accum == 0 or (bi0 + batch) >= len(Xtr):
+                scaler.step(opt)
+                scaler.update()
+                opt.zero_grad()
+        sched.step()
+
+        acc, prec, rec = evaluate_model(model, Xva, Yva, batch, device)
+        history["acc"].append(acc)
+        history["precision"].append(prec)
+        history["recall"].append(rec)
+        history["loss"].append(total / len(Xtr) * batch)
+        if acc > best_acc:
+            best_acc = acc
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        if verbose and (ep % log_every == 0 or ep == 1):
+            print(f"{ep:02d}轮 loss{history['loss'][-1]:.3f} 验证{acc:.0%} "
+                  f"鱼精度{prec:.0%} 鱼召回{rec:.0%}", flush=True)
+
+    return model, best_state, history, best_acc

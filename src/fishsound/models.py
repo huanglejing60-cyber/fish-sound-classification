@@ -112,3 +112,109 @@ def build_pretrained_cnn14(pretrained_path=C.PRETRAIN_SAFETENSORS,
     model.fc_audioset = nn.Linear(2048, classes)
     init_layer(model.fc_audioset)
     return model
+
+
+# ==========================================================================
+# 轻量模型（用于端侧模型选型对比）：均为"从零训练"，输入 (N,64,300) log-mel，
+# 输出 (logits, emb)，与 Cnn14 的接口完全一致，方便统一训练/评估/导出。
+# 核心算子是深度可分离卷积（Depthwise-Separable）：把标准 3x3 卷积拆成
+# 「逐通道 3x3 卷积（depthwise）+ 1x1 跨通道融合（pointwise）」，
+# 计算量/参数量可降到原来的约 1/8～1/9，是手机、MCU 等端侧的标配。
+# ==========================================================================
+
+class DepthwiseSeparable(nn.Module):
+    """一个深度可分离卷积块：dw 3x3（分组卷积）→ BN/ReLU → pw 1x1 → BN/ReLU。"""
+
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+        self.dw = nn.Conv2d(in_ch, in_ch, 3, stride=stride, padding=1,
+                            groups=in_ch, bias=False)
+        self.bn_dw = nn.BatchNorm2d(in_ch)
+        self.pw = nn.Conv2d(in_ch, out_ch, 1, bias=False)
+        self.bn_pw = nn.BatchNorm2d(out_ch)
+        init_layer(self.dw)
+        init_layer(self.pw)
+        init_bn(self.bn_dw)
+        init_bn(self.bn_pw)
+
+    def forward(self, x):
+        x = F.relu_(self.bn_dw(self.dw(x)))
+        return F.relu_(self.bn_pw(self.pw(x)))
+
+
+class DsCnn(nn.Module):
+    """DS-CNN：ARM 关键词唤醒（KWS）经典的窄而深小网络，极致轻量（约 0.14M）。
+
+    结构：1 个标准卷积做通道投影 → 7 个深度可分离块（通道 32→256）→ 全局
+    平均池化 → 4 类全连接。频率/时间方向每两段做一次 2x2 降采样。
+    """
+
+    def __init__(self, classes=4):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(1, 32, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32), nn.ReLU(inplace=True))
+        plan = [(32, 32, 1), (32, 64, 2),
+                (64, 64, 1), (64, 128, 2),
+                (128, 128, 1), (128, 256, 2),
+                (256, 256, 1)]
+        self.blocks = nn.Sequential(
+            *[DepthwiseSeparable(a, b, s) for a, b, s in plan])
+        self.fc = nn.Linear(256, classes)
+        init_layer(self.fc)
+
+    def forward(self, x):
+        x = x.unsqueeze(1)            # (N,1,64,300)
+        x = self.stem(x)
+        x = self.blocks(x)
+        emb = torch.mean(x, dim=(2, 3))   # 全局平均池化
+        return self.fc(emb), emb
+
+
+class MobileNetAudio(nn.Module):
+    """MobileNet 风格：比 DS-CNN 更宽（通道到 1024）、容量更大（约 1.5M）。
+
+    结构沿用 MobileNet-V1 的「标准 stem + 一串深度可分离块」，并在末尾加
+    一个 1024→256 的隐藏全连接，兼顾表达能力与轻量。
+    """
+
+    def __init__(self, classes=4):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(1, 32, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32), nn.ReLU(inplace=True))
+        plan = [(32, 64, 1), (64, 128, 2),
+                (128, 256, 2), (256, 512, 2),
+                (512, 512, 1), (512, 512, 1),
+                (512, 1024, 2)]
+        self.blocks = nn.Sequential(
+            *[DepthwiseSeparable(a, b, s) for a, b, s in plan])
+        self.fc1 = nn.Linear(1024, 256)
+        self.fc2 = nn.Linear(256, classes)
+        init_layer(self.fc1)
+        init_layer(self.fc2)
+
+    def forward(self, x):
+        x = x.unsqueeze(1)
+        x = self.stem(x)
+        x = self.blocks(x)
+        x = torch.mean(x, dim=(2, 3))
+        x = F.dropout(x, 0.3, self.training)
+        emb = F.relu_(self.fc1(x))
+        emb = F.dropout(emb, 0.3, self.training)
+        return self.fc2(emb), emb
+
+
+def count_params(model):
+    """可训练参数总数（单位：个）。"""
+    return sum(p.numel() for p in model.parameters())
+
+
+def build_lightweight(name, classes=len(C.LABELS)):
+    """按名字构建轻量模型：'dscnn' 或 'mobilenet'。"""
+    name = name.lower()
+    if name in ("dscnn", "ds-cnn"):
+        return DsCnn(classes)
+    if name in ("mobilenet", "mobile"):
+        return MobileNetAudio(classes)
+    raise ValueError(f"未知轻量模型：{name}（可选 dscnn / mobilenet）")
